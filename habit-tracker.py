@@ -23,7 +23,7 @@ BG = (0.118, 0.122, 0.141)
 ZONE = [(0.137, 0.145, 0.169), (0.157, 0.165, 0.192)]
 GRID = (0.26, 0.27, 0.31)
 TEXT = (0.72, 0.74, 0.80)
-AGG = (0.96, 0.96, 0.98)  # single "all habits" line
+AGG = (0.96, 0.96, 0.98)
 PALETTE_HEX = ["#4cc9a7", "#f4a261", "#7aa2f7", "#e06c75", "#c792ea", "#e5c07b"]
 
 
@@ -41,13 +41,15 @@ class Store:
             "show_all": False,
             "habits": [],
             "log": {},
+            "hidden": {},
         }
         try:
             with open(DATA_PATH, encoding="utf-8") as f:
                 self.d.update(json.load(f))
         except (OSError, ValueError):
             pass
-        for t in list(self.d["tags"]) + [h["tag"] for h in self.d["habits"]]:
+
+        for t in list(self.d["tags"]) + [h.get("tag") for h in self.d["habits"] if h.get("tag")]:
             self.ensure_color(t)
 
     def save(self):
@@ -68,6 +70,31 @@ class Store:
             row.pop(hid, None)
         self.save()
 
+    def hidden_for_day(self, day):
+        day_key = day.isoformat()
+        hidden = self.d.get("hidden", {}).get(day_key, [])
+        if not isinstance(hidden, list):
+            return []
+        return hidden
+
+    def is_hidden_today(self, hid, day):
+        return hid in self.hidden_for_day(day)
+
+    def set_hidden_today(self, hid, day, hidden):
+        day_key = day.isoformat()
+        hidden_map = self.d.setdefault("hidden", {})
+        arr = hidden_map.setdefault(day_key, [])
+        if hidden:
+            if hid not in arr:
+                arr.append(hid)
+        else:
+            arr = [x for x in arr if x != hid]
+            if arr:
+                hidden_map[day_key] = arr
+            else:
+                hidden_map.pop(day_key, None)
+        self.save()
+
     def completion(self, h, v):
         """0..1 for the chart. Yes/No: 0 = False. Number: value / goal."""
         v = max(0.0, float(v or 0))
@@ -78,13 +105,19 @@ class Store:
         )
         return min(v / goal, 1.0) if goal else (1.0 if v else 0.0)
 
+    def habit_points(self, h, v):
+        """Weighted score points for a habit."""
+        return float(h.get("weight", 1) * self.completion(h, v))
+
     def average_completion(self, h, days):
-        """Average historical completion for this habit over the visible date range."""
         vals = [self.completion(h, self.value(d, h["id"])) for d in days]
         return sum(vals) / len(vals) if vals else 0.0
 
+    def average_habit_points(self, h, days):
+        avg = self.average_completion(h, days)
+        return float(h.get("weight", 1) * avg)
+
     def layout(self):
-        """[(tag, fraction_of_x_axis, [habits])] - tags with a % get it, the rest share what's left."""
         groups = {}
         for h in self.d["habits"]:
             groups.setdefault(h["tag"], []).append(h)
@@ -122,6 +155,7 @@ class App(Gtk.Window):
         self.store = Store()
         self.day = dt.date.today()
         self.point_hits = []
+        self.show_hidden = False
 
         # header bar
         hb = Gtk.HeaderBar(show_close_button=True, title="Habit Tracker")
@@ -149,10 +183,17 @@ class App(Gtk.Window):
         self.all_btn.connect("toggled", self.on_show_all)
         hb.pack_end(self.all_btn)
 
+        self.show_hidden_btn = Gtk.ToggleButton(label="Show hidden habits")
+        self.show_hidden_btn.set_tooltip_text("Show habits hidden for this day")
+        self.show_hidden_btn.connect("toggled", self.on_show_hidden)
+        hb.pack_end(self.show_hidden_btn)
+
         # table
         self.model = Gtk.ListStore(str, str, str, str, str, bool, bool, str, bool, str)
         self.tree = Gtk.TreeView(model=self.model)
         self.tree.connect("row-activated", self.on_row_activated)
+        self.tree.get_selection().connect("changed", self.on_selection_changed)
+
         for i, title in ((1, "Habit"), (2, "Tag"), (3, "Type"), (4, "Weight")):
             r = Gtk.CellRendererText()
             col = Gtk.TreeViewColumn(title, r, text=i)
@@ -165,9 +206,13 @@ class App(Gtk.Window):
 
         col = Gtk.TreeViewColumn("Entry")
         tog = Gtk.CellRendererToggle()
+        tog.set_property("xalign", 0.5)
         tog.connect("toggled", self.on_toggled)
+
         txt = Gtk.CellRendererText(editable=True)
+        txt.set_property("xalign", 0.5)
         txt.connect("edited", self.on_edited)
+
         col.pack_start(tog, False)
         col.pack_start(txt, True)
         col.add_attribute(tog, "active", 6)
@@ -175,10 +220,51 @@ class App(Gtk.Window):
         col.add_attribute(txt, "text", 7)
         col.add_attribute(txt, "visible", 8)
         col.set_min_width(110)
+        col.set_alignment(0.5)
         self.tree.append_column(col)
 
         sc = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
         sc.add(self.tree)
+
+        # note preview panel
+        note_frame = Gtk.Frame(label="Note")
+        note_frame.set_margin_top(6)
+        note_frame.set_margin_bottom(6)
+        note_frame.set_margin_start(4)
+        note_frame.set_margin_end(4)
+        self.note_label = Gtk.Label(
+            label="No habit selected",
+            xalign=0,
+            yalign=0,
+            wrap=True,
+            selectable=True,
+            valign=Gtk.Align.START,
+            margin=8,
+        )
+        note_frame.add(self.note_label)
+
+        # selected habit quick controls
+        ctrl_frame = Gtk.Frame(label="Entry")
+        ctrl_frame.set_margin_top(6)
+        ctrl_frame.set_margin_bottom(6)
+        ctrl_frame.set_margin_start(4)
+        ctrl_frame.set_margin_end(4)
+
+        self.entry_minus = Gtk.Button(label="-")
+        self.entry_value = Gtk.Label(label="0", xalign=0.5)
+        self.entry_plus = Gtk.Button(label="+")
+        self.hide_today_btn = Gtk.Button(label="Hide today")
+        self.entry_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin=8)
+        self.entry_box.pack_start(self.entry_minus, False, False, 0)
+        self.entry_box.pack_start(self.entry_value, False, False, 0)
+        self.entry_box.pack_start(self.entry_plus, False, False, 0)
+        self.entry_box.pack_start(self.hide_today_btn, False, False, 0)
+
+        self.entry_minus.connect("clicked", self.on_entry_minus)
+        self.entry_plus.connect("clicked", self.on_entry_plus)
+        self.hide_today_btn.connect("clicked", self.on_hide_today)
+
+        ctrl_frame.add(self.entry_box)
 
         bar = Gtk.Box(spacing=6, margin=6)
         for label, cb in (
@@ -193,6 +279,8 @@ class App(Gtk.Window):
 
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         left.pack_start(sc, True, True, 0)
+        left.pack_start(note_frame, False, False, 0)
+        left.pack_start(ctrl_frame, False, False, 0)
         left.pack_start(bar, False, False, 0)
 
         # chart
@@ -228,6 +316,78 @@ class App(Gtk.Window):
         tooltip.set_text(best[1])
         return True
 
+    def on_show_hidden(self, btn):
+        self.show_hidden = btn.get_active()
+        self.refresh()
+
+    def on_selection_changed(self, selection):
+        _model, treeiter = selection.get_selected()
+        if treeiter is None:
+            self.note_label.set_text("No habit selected")
+            self.entry_value.set_text("—")
+            self.entry_minus.set_sensitive(False)
+            self.entry_plus.set_sensitive(False)
+            self.hide_today_btn.set_sensitive(False)
+            self.hide_today_btn.set_label("Hide today")
+            return
+
+        hid = self.model[treeiter][0]
+        h = self.habit(hid)
+        self.entry_minus.set_sensitive(True)
+        self.entry_plus.set_sensitive(True)
+        self.hide_today_btn.set_sensitive(True)
+
+        value = self.store.value(self.day, h["id"])
+        if h["kind"] == "bool":
+            self.entry_value.set_text("Yes" if value else "No")
+        else:
+            self.entry_value.set_text(f"{value:g}")
+
+        if self.store.is_hidden_today(hid, self.day):
+            self.hide_today_btn.set_label("Show today")
+        else:
+            self.hide_today_btn.set_label("Hide today")
+
+        note = (h.get("note") or "").strip()
+        if not note:
+            self.note_label.set_text("No note for this habit.")
+        else:
+            self.note_label.set_text(note)
+
+    def on_entry_minus(self, *_):
+        hid = self.selected()
+        if not hid:
+            return
+        h = self.habit(hid)
+        current = self.store.value(self.day, hid)
+        if h["kind"] == "bool":
+            new_value = 0
+        else:
+            new_value = max(0.0, current - 1.0)
+        self.store.set_value(self.day, hid, new_value)
+        self.refresh()
+
+    def on_entry_plus(self, *_):
+        hid = self.selected()
+        if not hid:
+            return
+        h = self.habit(hid)
+        current = self.store.value(self.day, hid)
+        if h["kind"] == "bool":
+            new_value = 1
+        else:
+            new_value = current + 1.0
+        self.store.set_value(self.day, hid, new_value)
+        self.refresh()
+
+    def on_hide_today(self, *_):
+        hid = self.selected()
+        if not hid:
+            return
+        hidden = self.store.is_hidden_today(hid, self.day)
+        self.store.set_hidden_today(hid, self.day, not hidden)
+        self.refresh()
+
     # ---- header actions
     def shift(self, n):
         self.day += dt.timedelta(days=n)
@@ -246,6 +406,9 @@ class App(Gtk.Window):
     def refresh(self):
         self.model.clear()
         for h in self.store.d["habits"]:
+            if self.store.is_hidden_today(h["id"], self.day) and not self.show_hidden:
+                continue
+
             v = self.store.value(self.day, h["id"])
             is_bool = h["kind"] == "bool"
             if is_bool:
@@ -254,24 +417,25 @@ class App(Gtk.Window):
                 detail = h.get("unit") or "number"
                 if h.get("target"):
                     detail += f" (goal {h['target']:g})"
-            self.model.append(
-                [
-                    h["id"],
-                    h["name"],
-                    h["tag"],
-                    detail,
-                    f"{h['weight']:g}",
-                    is_bool,
-                    bool(v),
-                    f"{v:g}",
-                    not is_bool,
-                    self.store.tag_hex(h["tag"]),
-                ]
-            )
+
+            self.model.append([
+                h["id"],
+                h["name"],
+                h["tag"],
+                detail,
+                f"{h['weight']:g}",
+                is_bool,
+                bool(v),
+                f"{v:g}",
+                not is_bool,
+                self.store.tag_hex(h["tag"]),
+            ])
+
         label = self.day.strftime("%a %d %b %Y")
         self.date_btn.set_label("Today" if self.day == dt.date.today() else label)
         self.date_btn.set_tooltip_text(label + " (click = jump to today)")
         self.chart.queue_draw()
+        self.on_selection_changed(self.tree.get_selection())
 
     def habit(self, hid):
         return next(h for h in self.store.d["habits"] if h["id"] == hid)
@@ -311,6 +475,11 @@ class App(Gtk.Window):
         self.store.d["habits"] = [h for h in self.store.d["habits"] if h["id"] != hid]
         for row in self.store.d["log"].values():
             row.pop(hid, None)
+        self.store.d.setdefault("hidden", {})
+        for day_key, items in list(self.store.d["hidden"].items()):
+            self.store.d["hidden"][day_key] = [x for x in items if x != hid]
+            if not self.store.d["hidden"][day_key]:
+                del self.store.d["hidden"][day_key]
         self.store.save()
         self.refresh()
 
@@ -319,21 +488,46 @@ class App(Gtk.Window):
         dlg = Gtk.Dialog(title="Habit", transient_for=self, modal=True)
         dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
         grid = Gtk.Grid(row_spacing=8, column_spacing=10, margin=14)
+
         name = Gtk.Entry(hexpand=True, activates_default=True)
         tag = Gtk.ComboBoxText.new_with_entry()
         for t in self.store.d["tags"]:
             tag.append_text(t)
+
         kind = Gtk.ComboBoxText()
         kind.append_text("Yes / No")
         kind.append_text("Number (minutes, reps, anything)")
         unit = Gtk.Entry(placeholder_text="min, reps, pages, ...")
         target = Gtk.Entry(placeholder_text="daily goal (optional, makes 100% on the chart)")
         weight = Gtk.SpinButton.new_with_range(0.5, 20, 0.5)
-        rows = [("Name", name), ("Tag", tag), ("Type", kind), ("Unit", unit),
-                ("Goal", target), ("Weight", weight)]
+
+        rows = [
+            ("Name", name),
+            ("Tag", tag),
+            ("Type", kind),
+            ("Unit", unit),
+            ("Goal", target),
+            ("Weight", weight),
+        ]
         for i, (lbl, w) in enumerate(rows):
             grid.attach(Gtk.Label(label=lbl, xalign=1), 0, i, 1, 1)
             grid.attach(w, 1, i, 1, 1)
+
+        note_tv = Gtk.TextView()
+        note_tv.set_wrap_mode(Gtk.WrapMode.WORD)
+        note_sw = Gtk.ScrolledWindow()
+        note_sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        note_sw.set_size_request(-1, 120)
+        note_sw.add(note_tv)
+
+        note_expander = Gtk.Expander(label="Notes")
+        note_expander.set_expanded(False)
+        note_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        note_box.pack_start(note_sw, True, True, 0)
+        note_expander.add(note_box)
+
+        grid.attach(note_expander, 0, len(rows), 2, 1)
+
         grid.attach(
             Gtk.Label(
                 label="Weight = how many points / how much width this habit gets inside its tag. "
@@ -343,7 +537,7 @@ class App(Gtk.Window):
                 max_width_chars=44,
             ),
             1,
-            len(rows),
+            len(rows) + 1,
             1,
             1,
         )
@@ -354,6 +548,7 @@ class App(Gtk.Window):
             target.set_sensitive(num)
 
         kind.connect("changed", sync)
+
         if h:
             name.set_text(h["name"])
             tag.get_child().set_text(h["tag"])
@@ -361,10 +556,14 @@ class App(Gtk.Window):
             unit.set_text(h.get("unit") or "")
             target.set_text(f"{h['target']:g}" if h.get("target") else "")
             weight.set_value(h["weight"])
+
+            buf = note_tv.get_buffer()
+            buf.set_text(h.get("note") or "")
         else:
             tag.get_child().set_text(next(iter(self.store.d["tags"]), "general"))
             kind.set_active(0)
             weight.set_value(1)
+
         sync()
 
         dlg.get_content_area().add(grid)
@@ -376,6 +575,14 @@ class App(Gtk.Window):
                 goal = float(target.get_text().replace(",", ".")) if target.get_text().strip() else None
             except ValueError:
                 goal = None
+
+            note_buffer = note_tv.get_buffer()
+            note_text = note_buffer.get_text(
+                note_buffer.get_start_iter(),
+                note_buffer.get_end_iter(),
+                False,
+            )
+
             rec = {
                 "id": h["id"] if h else uuid.uuid4().hex[:8],
                 "name": name.get_text().strip(),
@@ -384,16 +591,21 @@ class App(Gtk.Window):
                 "unit": unit.get_text().strip(),
                 "target": goal if kind.get_active() == 1 else None,
                 "weight": weight.get_value(),
+                "note": note_text.strip(),
             }
+
             if rec["tag"] not in self.store.d["tags"]:
                 self.store.d["tags"][rec["tag"]] = None
             self.store.ensure_color(rec["tag"])
+
             if h:
                 h.update(rec)
             else:
                 self.store.d["habits"].append(rec)
+
             self.store.save()
             self.refresh()
+
         dlg.destroy()
 
     def on_tags(self, *_):
@@ -401,7 +613,7 @@ class App(Gtk.Window):
         dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
         dlg.set_default_size(400, 340)
 
-        ls = Gtk.ListStore(str, str, str)  # name, percent, color hex
+        ls = Gtk.ListStore(str, str, str)
         for t, p in self.store.d["tags"].items():
             ls.append([t, "" if p is None else f"{p:g}", self.store.tag_hex(t)])
 
@@ -479,9 +691,6 @@ class App(Gtk.Window):
         dlg.destroy()
 
     # ---- chart
-    # x = tag zones sized by their %, habits inside them sized by weight; y = days (time flows up).
-    # White line = ALL habits in one: its x is the sum of (slot width * completion) of every habit.
-    # "All habits" button adds one line per habit, in its tag's color.
     def draw(self, area, cr):
         W, H = area.get_allocated_width(), area.get_allocated_height()
         cr.set_source_rgb(*BG)
@@ -490,7 +699,12 @@ class App(Gtk.Window):
         cr.set_font_size(11)
         self.point_hits = []
 
-        if not self.store.d["habits"]:
+        visible_habits = [
+            h for h in self.store.d["habits"]
+            if (not self.store.is_hidden_today(h["id"], self.day)) or self.show_hidden
+        ]
+
+        if not visible_habits:
             cr.set_source_rgb(*TEXT)
             cr.move_to(W / 2 - 80, H / 2)
             cr.show_text("Add a habit to start")
@@ -507,10 +721,42 @@ class App(Gtk.Window):
         yc = lambda i: T + ph - (i + 0.5) * rowh
 
         show_all = self.all_btn.get_active()
+        total_points = sum(float(h.get("weight", 1)) for h in visible_habits)
+        if total_points <= 0:
+            total_points = 1.0
 
-        # tag zones + habit slots
+        x_axis_y = T + ph + 14
+        cr.set_source_rgb(*GRID)
+        cr.move_to(L, x_axis_y)
+        cr.line_to(L + pw, x_axis_y)
+        cr.stroke()
+
+        tick_values = [0, 0.25, 0.5, 0.75, 1.0]
+        for k in tick_values:
+            x = L + k * pw
+            val = k * total_points
+            cr.move_to(x, x_axis_y)
+            cr.line_to(x, x_axis_y + 6)
+            cr.stroke()
+            cr.move_to(x - 10, x_axis_y + 18)
+            cr.show_text(f"{val:g}")
+
+        groups = {}
+        for h in visible_habits:
+            groups.setdefault(h["tag"], []).append(h)
+
+        tags = self.store.d["tags"]
+        names = [t for t in tags if t in groups] + [t for t in groups if t not in tags]
+        fixed = {t: float(tags[t]) for t in names if tags.get(t) is not None}
+        rest = [t for t in names if t not in fixed]
+        left = 100 - sum(fixed.values())
+        each = left / len(rest) if rest and left > 0 else 5
+        raw = {t: fixed.get(t, each) for t in names}
+        total = sum(raw.values()) or 1
+        layout = [(t, raw[t] / total, groups[t]) for t in names]
+
         slots, x = [], L
-        for gi, (tag, frac, hs) in enumerate(self.store.layout()):
+        for gi, (tag, frac, hs) in enumerate(layout):
             zw = pw * frac
             color = hex_to_rgb(self.store.tag_hex(tag))
             base = ZONE[gi % 2]
@@ -531,7 +777,6 @@ class App(Gtk.Window):
                 sx += sw
             x += zw
 
-        # day grid + labels
         step = max(1, math.ceil(n / max(1, ph / 18)))
         cr.set_line_width(1)
         for i, d in enumerate(days):
@@ -544,8 +789,7 @@ class App(Gtk.Window):
                 cr.move_to(6, yc(i) + 4)
                 cr.show_text(d.strftime("%d %b"))
 
-        # show habit names + separators only in all-habits mode
-        if show_all:
+        if show_all and slots:
             for h, sx, sw, color in slots:
                 cr.set_source_rgb(*GRID)
                 cr.move_to(sx, T)
@@ -563,15 +807,13 @@ class App(Gtk.Window):
             cr.line_to(L + pw, T + ph)
             cr.stroke()
 
-        # all habits mode: show each habit line + its grey average line
-        if show_all:
+        if show_all and slots:
             for h, sx, sw, color in slots:
                 pad = min(8, sw * 0.15)
                 pts = []
-
                 for i, d in enumerate(days):
-                    c = self.store.completion(h, self.store.value(d, h["id"]))
-                    x_pos = sx + pad + c * (sw - 2 * pad)
+                    score = self.store.habit_points(h, self.store.value(d, h["id"]))
+                    x_pos = sx + pad + (score / total_points) * (sw - 2 * pad)
                     pts.append((x_pos, yc(i)))
 
                 cr.set_source_rgba(*color, 0.9)
@@ -582,47 +824,51 @@ class App(Gtk.Window):
                 cr.stroke()
 
                 for i, (px, py) in enumerate(pts):
-                    pct = self.store.completion(h, self.store.value(days[i], h["id"])) * 100
-                    self.point_hits.append((px, py, f"{h['name']}: {pct:.0f}%"))
+                    score = self.store.habit_points(h, self.store.value(days[i], h["id"]))
+                    self.point_hits.append((px, py, f"{h['name']}: {score:.1f} pts"))
                     cr.arc(px, py, 3.6 if i == n - 1 else 2.2, 0, 2 * math.pi)
                     cr.fill()
 
-                avg_x = sx + pad + self.store.average_completion(h, days) * (sw - 2 * pad)
+                avg_score = self.store.average_habit_points(h, days)
+                avg_pts = []
+                for i in range(n):
+                    x_pos = sx + pad + (avg_score / total_points) * (sw - 2 * pad)
+                    avg_pts.append((x_pos, yc(i)))
+
                 cr.set_source_rgba(0.75, 0.75, 0.75, 0.85)
                 cr.set_line_width(1.1)
-
-                # draw grey average line + points on it
-                avg_pts = [(avg_x, yc(i)) for i in range(n)]
                 cr.move_to(*avg_pts[0])
                 for p in avg_pts[1:]:
                     cr.line_to(*p)
                 cr.stroke()
                 for px, py in avg_pts:
-                    self.point_hits.append((px, py, f"{h['name']} avg: {self.store.average_completion(h, days) * 100:.0f}%"))
+                    self.point_hits.append((px, py, f"{h['name']} avg: {avg_score:.1f} pts"))
                     cr.arc(px, py, 2.4, 0, 2 * math.pi)
                     cr.fill()
 
-        # normal mode: aggregate white line + grey average guide line
-        if not show_all:
+        if not show_all and slots:
             agg = []
             for i, d in enumerate(days):
-                xs = L + sum(
-                    sw * self.store.completion(h, self.store.value(d, h["id"]))
-                    for h, _sx, sw, _c in slots
-                )
-                agg.append((xs, yc(i)))
+                total = 0.0
+                for h, _sx, _sw, _c in slots:
+                    total += self.store.habit_points(h, self.store.value(d, h["id"]))
+                x_pos = L + (total / total_points) * pw
+                agg.append((x_pos, yc(i)))
 
-            avg_x = sum(x for x, _ in agg) / len(agg) if agg else L
+            avg_total = 0.0
+            for h, _sx, _sw, _c in slots:
+                avg_total += self.store.average_habit_points(h, days)
+            avg_x = L + (avg_total / total_points) * pw
+            avg_pts = [(avg_x, yc(i)) for i in range(n)]
+
             cr.set_source_rgba(0.75, 0.75, 0.75, 0.85)
             cr.set_line_width(1.2)
-
-            avg_pts = [(avg_x, yc(i)) for i in range(n)]
             cr.move_to(*avg_pts[0])
             for p in avg_pts[1:]:
                 cr.line_to(*p)
             cr.stroke()
             for px, py in avg_pts:
-                self.point_hits.append((px, py, f"All habits avg: {((avg_x - L) / max(1.0, pw)) * 100:.0f}%"))
+                self.point_hits.append((px, py, f"All habits avg: {avg_total:.1f} pts"))
                 cr.arc(px, py, 2.8, 0, 2 * math.pi)
                 cr.fill()
 
@@ -634,8 +880,10 @@ class App(Gtk.Window):
             cr.stroke()
 
             for i, (px, py) in enumerate(agg):
-                pct = ((px - L) / max(1.0, pw)) * 100.0
-                self.point_hits.append((px, py, f"All habits: {pct:.0f}%"))
+                score = 0.0
+                for h, _sx, _sw, _c in slots:
+                    score += self.store.habit_points(h, self.store.value(days[i], h["id"]))
+                self.point_hits.append((px, py, f"All habits: {score:.1f} pts"))
                 cr.arc(px, py, 5 if i == n - 1 else 3.2, 0, 2 * math.pi)
                 cr.fill()
 
