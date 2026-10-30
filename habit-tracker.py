@@ -41,7 +41,6 @@ class Store:
             "show_all": False,
             "habits": [],
             "log": {},
-            "hidden": {},
         }
         try:
             with open(DATA_PATH, encoding="utf-8") as f:
@@ -70,31 +69,6 @@ class Store:
             row.pop(hid, None)
         self.save()
 
-    def hidden_for_day(self, day):
-        day_key = day.isoformat()
-        hidden = self.d.get("hidden", {}).get(day_key, [])
-        if not isinstance(hidden, list):
-            return []
-        return hidden
-
-    def is_hidden_today(self, hid, day):
-        return hid in self.hidden_for_day(day)
-
-    def set_hidden_today(self, hid, day, hidden):
-        day_key = day.isoformat()
-        hidden_map = self.d.setdefault("hidden", {})
-        arr = hidden_map.setdefault(day_key, [])
-        if hidden:
-            if hid not in arr:
-                arr.append(hid)
-        else:
-            arr = [x for x in arr if x != hid]
-            if arr:
-                hidden_map[day_key] = arr
-            else:
-                hidden_map.pop(day_key, None)
-        self.save()
-
     def completion(self, h, v):
         """0..1 for the chart. Yes/No: 0 = False. Number: value / goal."""
         v = max(0.0, float(v or 0))
@@ -106,7 +80,6 @@ class Store:
         return min(v / goal, 1.0) if goal else (1.0 if v else 0.0)
 
     def habit_points(self, h, v):
-        """Weighted score points for a habit."""
         return float(h.get("weight", 1) * self.completion(h, v))
 
     def average_completion(self, h, days):
@@ -156,6 +129,8 @@ class App(Gtk.Window):
         self.day = dt.date.today()
         self.point_hits = []
         self.show_hidden = False
+        self.hidden_today = set()
+        self.hidden_day = None
 
         # header bar
         hb = Gtk.HeaderBar(show_close_button=True, title="Habit Tracker")
@@ -297,6 +272,11 @@ class App(Gtk.Window):
         self.add(paned)
         self.refresh()
 
+    def sync_hidden_for_day(self):
+        if self.hidden_day != self.day:
+            self.hidden_today.clear()
+            self.hidden_day = self.day
+
     def on_query_tooltip(self, widget, x, y, keyboard_mode, tooltip):
         if not self.point_hits:
             return False
@@ -331,6 +311,7 @@ class App(Gtk.Window):
             self.hide_today_btn.set_label("Hide today")
             return
 
+        self.sync_hidden_for_day()
         hid = self.model[treeiter][0]
         h = self.habit(hid)
         self.entry_minus.set_sensitive(True)
@@ -343,7 +324,7 @@ class App(Gtk.Window):
         else:
             self.entry_value.set_text(f"{value:g}")
 
-        if self.store.is_hidden_today(hid, self.day):
+        if hid in self.hidden_today:
             self.hide_today_btn.set_label("Show today")
         else:
             self.hide_today_btn.set_label("Hide today")
@@ -384,8 +365,11 @@ class App(Gtk.Window):
         hid = self.selected()
         if not hid:
             return
-        hidden = self.store.is_hidden_today(hid, self.day)
-        self.store.set_hidden_today(hid, self.day, not hidden)
+        self.sync_hidden_for_day()
+        if hid in self.hidden_today:
+            self.hidden_today.remove(hid)
+        else:
+            self.hidden_today.add(hid)
         self.refresh()
 
     # ---- header actions
@@ -404,9 +388,10 @@ class App(Gtk.Window):
 
     # ---- table
     def refresh(self):
+        self.sync_hidden_for_day()
         self.model.clear()
         for h in self.store.d["habits"]:
-            if self.store.is_hidden_today(h["id"], self.day) and not self.show_hidden:
+            if h["id"] in self.hidden_today and not self.show_hidden:
                 continue
 
             v = self.store.value(self.day, h["id"])
@@ -475,11 +460,6 @@ class App(Gtk.Window):
         self.store.d["habits"] = [h for h in self.store.d["habits"] if h["id"] != hid]
         for row in self.store.d["log"].values():
             row.pop(hid, None)
-        self.store.d.setdefault("hidden", {})
-        for day_key, items in list(self.store.d["hidden"].items()):
-            self.store.d["hidden"][day_key] = [x for x in items if x != hid]
-            if not self.store.d["hidden"][day_key]:
-                del self.store.d["hidden"][day_key]
         self.store.save()
         self.refresh()
 
@@ -692,6 +672,7 @@ class App(Gtk.Window):
 
     # ---- chart
     def draw(self, area, cr):
+        self.sync_hidden_for_day()
         W, H = area.get_allocated_width(), area.get_allocated_height()
         cr.set_source_rgb(*BG)
         cr.paint()
@@ -701,7 +682,7 @@ class App(Gtk.Window):
 
         visible_habits = [
             h for h in self.store.d["habits"]
-            if (not self.store.is_hidden_today(h["id"], self.day)) or self.show_hidden
+            if h["id"] not in self.hidden_today or self.show_hidden
         ]
 
         if not visible_habits:
